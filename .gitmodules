@@ -8,5 +8,5 @@
 	branch = main
 [submodule "geometry4Sharp"]
 	path = geometry4Sharp
-	url = https://github.com/NewWheelTech/geometry4Sharp
+	url = https://github.com/NewWheelTech/geometry4Sharp.git
 	branch = main
