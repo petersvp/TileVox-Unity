@@ -2,12 +2,28 @@
 
 Unity package ID: `com.pidev.tilevox`
 
-This repository is an embedded Unity package. Check it out at
-`<Unity project>/Packages/com.pidev.tilevox` and initialize its Git submodules.
+Check out this repository at `<Unity project>/Packages/com.pidev.tilevox`.
+Unity treats that directory as an embedded package, so edits in these working
+trees are visible in the game immediately.
 
-- `VoxelCore/` comes from [petersvp/VoxelCore](https://github.com/petersvp/VoxelCore).
-- `TileVox/` comes from [petersvp/TileVox](https://github.com/petersvp/TileVox).
+This package contains two Git submodules:
 
-The submodules track `main` for explicit upstream updates. A normal recursive
-checkout uses the commits recorded by this repository. For live development,
-check out `main` in each submodule and edit the working trees in place.
+- `VoxelCore/`: [petersvp/VoxelCore](https://github.com/petersvp/VoxelCore)
+- `TileVox/`: [petersvp/TileVox](https://github.com/petersvp/TileVox)
+
+After cloning, from the package root:
+
+```sh
+git submodule update --init --recursive
+git -C VoxelCore switch main
+git -C TileVox switch main
+```
+
+Each submodule records a specific commit. To deliberately advance both to the
+current `main` branch heads, run:
+
+```sh
+git submodule update --remote --merge -- VoxelCore TileVox
+```
+
+Commit the updated submodule pointers in this repository after updating them.
