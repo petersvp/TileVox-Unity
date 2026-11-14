@@ -6,7 +6,7 @@
 	path = TileVox
 	url = https://github.com/petersvp/TileVox.git
 	branch = main
-[submodule "geometry3Sharp"]
-	path = geometry3Sharp
-	url = https://github.com/gradientspace/geometry3Sharp.git
-	branch = dotnet8
+[submodule "geometry4Sharp"]
+	path = geometry4Sharp
+	url = https://github.com/NewWheelTech/geometry4Sharp.git
+	branch = main
