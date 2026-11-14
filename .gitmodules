@@ -6,3 +6,7 @@
 	path = TileVox
 	url = https://github.com/petersvp/TileVox.git
 	branch = main
+[submodule "GeometryCore"]
+	path = GeometryCore
+	url = https://github.com/petersvp/GeometryCore.git
+	branch = main
