@@ -1,0 +1,8 @@
+[submodule "VoxelCore"]
+	path = VoxelCore
+	url = https://github.com/petersvp/VoxelCore.git
+	branch = main
+[submodule "TileVox"]
+	path = TileVox
+	url = https://github.com/petersvp/TileVox.git
+	branch = main
