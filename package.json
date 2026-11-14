@@ -2,5 +2,5 @@
   "name": "com.pidev.tilevox",
   "version": "0.1.0",
   "displayName": "TileVox",
-  "description": "Unity package for TileVox, VoxelCore, and GeometryCore."
+  "description": "Unity package for TileVox, VoxelCore, and geometry3Sharp."
 }
