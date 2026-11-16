@@ -1,0 +1,22 @@
+{
+    "name": "TileVoxUnity",
+    "rootNamespace": "TileVoxUnity",
+    "references": [
+        "GUID:334fdda72c4d11747b01b413837fa932"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "Unity",
+            "expression": "",
+            "define": "G3_USING_UNITY"
+        }
+    ],
+    "noEngineReferences": false
+}
