@@ -1,9 +1,10 @@
 {
-  "name": "com.pidev.tilevox",
+  "name": "com.pidev.worldflow",
   "version": "0.1.0",
-  "displayName": "TileVox For Unity",
-  "description": "Unity package for TileVox, VoxelCore, and geometry3Sharp.",
+  "displayName": "Pi-Dev WorldFlow Designer",
+  "description": "Rapid procedural world-building suite.",
   "dependencies": {
-    "com.unity.splines": "2.8.4"
+    "com.unity.splines": "2.8.4",
+	"com.unity.mathematics": "1.2.1"
   }
 }
