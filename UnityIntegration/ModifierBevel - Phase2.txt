@@ -1,0 +1,553 @@
+using g4;
+using System;
+using System.Collections.Generic;
+using TileVox.Meshing;
+
+namespace WorldFlow
+{
+    /// <summary>Offsets selected quad sides and cuts adjoining faces for a bevel profile.</summary>
+    public class ModifierBevel
+    {
+        private const uint CutColor = 0xFF0000FF;
+        private const uint MovedColor = 0xFFFF00FF;
+        private class SurfaceQuad
+        {
+            public Vector3d[] points;
+            public SurfaceEdge[] edges = new SurfaceEdge[4];
+            public int[] vertexIds = new int[4];
+            public double[] notchU = new double[4], notchV = new double[4];
+            public bool[] outerProfile = new bool[4];
+            public SideCapOffsets[] sideCaps;
+            public Vector3d normal;
+            public uint color, material;
+        }
+
+        private struct SideCapOffsets
+        {
+            public double insetU, insetV;
+            public double notchU, notchV;
+        }
+
+        private class SurfaceEdge
+        {
+            public Vector3d a, b;
+            public SurfaceQuad first, second;
+            public bool selected;
+            public double width;
+        }
+
+        private readonly StructureMesherResult3D source;
+        private readonly List<SurfaceQuad> quads = new();
+        private readonly List<SurfaceEdge> edges = new();
+        private readonly Dictionary<(double x, double y, double z), int> vertices = new();
+        private readonly Dictionary<(int a, int b), SurfaceEdge> edgeLookup = new();
+        private readonly Dictionary<int, List<(SurfaceQuad quad, int corner)>> incidentQuads = new();
+        private readonly Dictionary<int, List<SurfaceEdge>> incidentEdges = new();
+
+        public IList<EdgeSelection> edgeSets;
+        public double bevelDistance = 0.2;
+        public int bevelSegments = 1;
+        public double profileRoundness = 0.5;
+
+        public ModifierBevel(StructureMesherResult3D source)
+        {
+            this.source = source;
+        }
+
+        /// <summary>Returns shrunken faces and profiled junction ngons.</summary>
+        public StructureMesherResult3D Apply()
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (profileRoundness >= 1) return source;
+            quads.Clear();
+            edges.Clear();
+            vertices.Clear();
+            edgeLookup.Clear();
+            incidentQuads.Clear();
+            incidentEdges.Clear();
+
+            ImportQuads();
+            BuildAdjacency();
+            SelectEdges();
+            CutJunctionFaces();
+            CutSideCaps();
+
+            var output = new List<Face>(quads.Count);
+            List<NgonFace> outputNgons = null;
+            foreach (var quad in quads)
+            {
+                Vector3d center = (quad.points[0] + quad.points[1] + quad.points[2] + quad.points[3]) * 0.25;
+                var moved = new Vector3d[4];
+                for (int i = 0; i < 4; i++) moved[i] = OffsetCorner(quad, i, center);
+                List<Vector3d> outline = null;
+                for (int i = 0; i < 4; i++)
+                {
+                    Vector3d origin = quad.points[i];
+                    Vector3d outgoing = (quad.points[(i + 1) & 3] - origin).Normalized;
+                    Vector3d incoming = (quad.points[(i + 3) & 3] - origin).Normalized;
+                    double notchU = quad.notchU[i], notchV = quad.notchV[i];
+                    SideCapOffsets sideCaps = quad.sideCaps == null ? default : quad.sideCaps[i];
+                    bool meetsTwoSideCaps = sideCaps.insetU > 1e-12 && sideCaps.insetV > 1e-12;
+                    if (meetsTwoSideCaps)
+                    {
+                        notchU = profileRoundness > 0 ? sideCaps.insetU : Math.Max(notchU, sideCaps.notchU);
+                        notchV = profileRoundness > 0 ? sideCaps.insetV : Math.Max(notchV, sideCaps.notchV);
+                    }
+                    double u = notchU - Vector3d.Dot(moved[i] - origin, outgoing);
+                    double v = notchV - Vector3d.Dot(moved[i] - origin, incoming);
+                    bool outer = (quad.outerProfile[i] || meetsTwoSideCaps) && profileRoundness > 0;
+                    double startAngle = 0, endAngle = 0;
+                    bool cut = u > 1e-12 && v > 1e-12 &&
+                        (!outer || TryGetOuterAngles(origin, moved[i], outgoing, incoming,
+                            notchU, notchV, out startAngle, out endAngle));
+                    if (cut)
+                    {
+                        if (outline == null)
+                        {
+                            outline = new List<Vector3d>(12);
+                            for (int j = 0; j < i; j++) outline.Add(moved[j]);
+                        }
+                        if (outer)
+                            AppendOuterProfile(outline, origin, outgoing, incoming,
+                                notchU, notchV, startAngle, endAngle);
+                        else AppendInnerProfile(outline, moved[i], incoming * v, outgoing * u);
+                    }
+                    else outline?.Add(moved[i]);
+                }
+                if (outline == null)
+                    output.Add(new Face(moved[0], moved[1], moved[2], moved[3],
+                        QuadWasMoved(quad, moved) ? MovedColor : quad.color, quad.material));
+                else
+                {
+                    outputNgons ??= source.Ngons == null
+                        ? new List<NgonFace>() : new List<NgonFace>(source.Ngons);
+                    outputNgons.Add(new NgonFace(outline, CutColor, quad.material));
+                }
+            }
+
+            return new StructureMesherResult3D
+            {
+                Quads = output,
+                Ngons = outputNgons ?? source.Ngons,
+                Triangles = source.Triangles,
+                LedgeBoundaries = source.LedgeBoundaries,
+                BaseBoundaries = source.BaseBoundaries,
+                WallToCeilingBoundaries = source.WallToCeilingBoundaries,
+                CeilingToWallBoundaries = source.CeilingToWallBoundaries,
+                WallCornerBoundaries = source.WallCornerBoundaries,
+                MaterialBoundaries = source.MaterialBoundaries,
+                ColorBoundaries = source.ColorBoundaries
+            };
+        }
+
+        private void ImportQuads()
+        {
+            if (source.Quads == null) return;
+            foreach (var face in source.Quads)
+            {
+                Vector3d u = face.b - face.a;
+                Vector3d v = face.d - face.a;
+                if ((face.c - face.b - face.d + face.a).LengthSquared > 1e-16 ||
+                    !AxisAligned(u) || !AxisAligned(v))
+                {
+                    AddQuad(face.a, face.b, face.c, face.d, face.color, face.material);
+                    continue;
+                }
+
+                // Split merged block faces at voxel edges so selected boundary spans can
+                // shrink independently, even when they cover only part of a large quad.
+                int columns = TileCount(u), rows = TileCount(v);
+                Vector3d column = u / columns, row = v / rows;
+                for (int y = 0; y < rows; y++)
+                    for (int x = 0; x < columns; x++)
+                    {
+                        Vector3d a = face.a + column * x + row * y;
+                        AddQuad(a, a + column, a + column + row, a + row,
+                            face.color, face.material);
+                    }
+            }
+        }
+
+        private static int TileCount(Vector3d side)
+        {
+            double length = side.Length;
+            int count = (int)Math.Round(length);
+            return count > 1 && Math.Abs(length - count) < 1e-8 ? count : 1;
+        }
+
+        private static bool AxisAligned(Vector3d side)
+        {
+            int axes = (Math.Abs(side.x) > 1e-8 ? 1 : 0) +
+                (Math.Abs(side.y) > 1e-8 ? 1 : 0) + (Math.Abs(side.z) > 1e-8 ? 1 : 0);
+            return axes == 1;
+        }
+
+        private void AddQuad(Vector3d a, Vector3d b, Vector3d c, Vector3d d,
+            uint color, uint material)
+        {
+            Vector3d normal = Vector3d.Cross(b - a, c - a);
+            quads.Add(new SurfaceQuad
+            {
+                points = new[] { a, b, c, d },
+                normal = normal.LengthSquared > 1e-20 ? normal.Normalized : Vector3d.Zero,
+                color = color,
+                material = material
+            });
+        }
+
+        private void BuildAdjacency()
+        {
+            foreach (var quad in quads)
+                for (int corner = 0; corner < 4; corner++)
+                {
+                    int id = GetVertex(quad.points[corner]);
+                    quad.vertexIds[corner] = id;
+                    if (!incidentQuads.TryGetValue(id, out var incident))
+                    {
+                        incident = new List<(SurfaceQuad quad, int corner)>();
+                        incidentQuads.Add(id, incident);
+                    }
+                    incident.Add((quad, corner));
+                }
+
+            foreach (var quad in quads)
+                for (int side = 0; side < 4; side++)
+                {
+                    int a = quad.vertexIds[side];
+                    int b = quad.vertexIds[(side + 1) & 3];
+                    var key = a < b ? (a, b) : (b, a);
+                    if (!edgeLookup.TryGetValue(key, out SurfaceEdge edge))
+                    {
+                        edge = new SurfaceEdge
+                        {
+                            a = quad.points[side],
+                            b = quad.points[(side + 1) & 3]
+                        };
+                        edgeLookup.Add(key, edge);
+                        edges.Add(edge);
+                        AddIncidentEdge(a, edge);
+                        AddIncidentEdge(b, edge);
+                    }
+                    if (edge.first == null) edge.first = quad;
+                    else if (edge.second == null) edge.second = quad;
+                    quad.edges[side] = edge;
+                }
+        }
+
+        private int GetVertex(Vector3d point)
+        {
+            var key = (point.x, point.y, point.z);
+            if (vertices.TryGetValue(key, out int id)) return id;
+            id = vertices.Count;
+            vertices.Add(key, id);
+            return id;
+        }
+
+        private void AddIncidentEdge(int vertex, SurfaceEdge edge)
+        {
+            if (!incidentEdges.TryGetValue(vertex, out var incident))
+            {
+                incident = new List<SurfaceEdge>();
+                incidentEdges.Add(vertex, incident);
+            }
+            incident.Add(edge);
+        }
+
+        private void SelectEdges()
+        {
+            bool automatic = edgeSets == null || edgeSets.Count == 0;
+            foreach (var edge in edges)
+            {
+                if (edge.first == null || edge.second == null) continue;
+                if (automatic)
+                {
+                    edge.selected = Vector3d.Dot(edge.first.normal, edge.second.normal) < 0.9999;
+                    edge.width = bevelDistance;
+                    continue;
+                }
+
+                foreach (var set in edgeSets)
+                {
+                    if (set.edges == null) continue;
+                    foreach (var selected in set.edges)
+                        if (ContainsEdge(selected, edge.a, edge.b) &&
+                            (!edge.selected || set.parameter > edge.width))
+                        {
+                            edge.selected = true;
+                            edge.width = set.parameter;
+                        }
+                }
+            }
+        }
+
+        private static bool ContainsEdge(Edge selection, Vector3d a, Vector3d b)
+        {
+            Vector3d line = selection.b - selection.a;
+            double lengthSquared = line.LengthSquared;
+            if (lengthSquared < 1e-20) return false;
+            double aParameter = Vector3d.Dot(a - selection.a, line) / lengthSquared;
+            double bParameter = Vector3d.Dot(b - selection.a, line) / lengthSquared;
+            if (aParameter < -1e-8 || aParameter > 1 + 1e-8 ||
+                bParameter < -1e-8 || bParameter > 1 + 1e-8) return false;
+            return Vector3d.Cross(a - selection.a, line).LengthSquared < lengthSquared * 1e-16 &&
+                Vector3d.Cross(b - selection.a, line).LengthSquared < lengthSquared * 1e-16;
+        }
+
+        private void CutJunctionFaces()
+        {
+            foreach (var entry in incidentQuads)
+            {
+                int vertex = entry.Key;
+                if (!incidentEdges.TryGetValue(vertex, out var junctionEdges)) continue;
+                foreach (var (quad, corner) in entry.Value)
+                {
+                    Vector3d point = quad.points[corner];
+                    Vector3d outgoing = (quad.points[(corner + 1) & 3] - point).Normalized;
+                    Vector3d incoming = (quad.points[(corner + 3) & 3] - point).Normalized;
+                    double u = 0, v = 0;
+                    int participatingCount = 0;
+                    foreach (var edge in junctionEdges)
+                    {
+                        if (!edge.selected || edge.width == 0) continue;
+                        if (edge.first == quad || edge.second == quad)
+                        {
+                            participatingCount++;
+                            continue;
+                        }
+                        if (!SharesEdge(quad, edge.first) ||
+                            !SharesEdge(quad, edge.second)) continue;
+                        Vector3d direction = (edge.b - edge.a).Normalized;
+                        if (Math.Abs(Vector3d.Dot(quad.normal, direction)) < 0.9999)
+                            continue;
+                        double edgeU = 0, edgeV = 0;
+                        AccumulateInset(SideOffsetAtVertex(edge.first, edge, vertex),
+                            outgoing, incoming, ref edgeU, ref edgeV);
+                        AccumulateInset(SideOffsetAtVertex(edge.second, edge, vertex),
+                            outgoing, incoming, ref edgeU, ref edgeV);
+                        if (edgeU <= 1e-12 || edgeV <= 1e-12) continue;
+                        participatingCount++;
+                        u = Math.Max(u, edgeU);
+                        v = Math.Max(v, edgeV);
+                    }
+                    if (u > 1e-12 && v > 1e-12)
+                    {
+                        quad.notchU[corner] = u;
+                        quad.notchV[corner] = v;
+                        quad.outerProfile[corner] = participatingCount >= 3;
+                    }
+                }
+            }
+        }
+
+        private static void AccumulateInset(Vector3d inset, Vector3d outgoing,
+            Vector3d incoming, ref double u, ref double v)
+        {
+            u = Math.Max(u, Vector3d.Dot(inset, outgoing));
+            v = Math.Max(v, Vector3d.Dot(inset, incoming));
+        }
+
+        private static bool SharesEdge(SurfaceQuad first, SurfaceQuad second)
+        {
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                    if (first.edges[i] == second.edges[j])
+                        return true;
+            return false;
+        }
+
+        private void CutSideCaps()
+        {
+            foreach (var edge in edges)
+            {
+                if (!edge.selected || edge.width <= 0) continue;
+                CutSideCap(edge, edge.a, edge.b);
+                CutSideCap(edge, edge.b, edge.a);
+            }
+        }
+
+        private void CutSideCap(SurfaceEdge edge, Vector3d point, Vector3d otherEnd)
+        {
+            if (!vertices.TryGetValue((point.x, point.y, point.z), out int vertex) ||
+                !incidentQuads.TryGetValue(vertex, out var incident)) return;
+            Vector3d firstInset = SideOffsetAtVertex(edge.first, edge, vertex);
+            Vector3d secondInset = SideOffsetAtVertex(edge.second, edge, vertex);
+            if (Vector3d.Dot(edge.first.normal, secondInset) >= -1e-12 ||
+                Vector3d.Dot(edge.second.normal, firstInset) >= -1e-12)
+                return;
+            Vector3d extension = (point - otherEnd).Normalized;
+            if (incidentEdges.TryGetValue(vertex, out var neighbors))
+                foreach (var neighbor in neighbors)
+                {
+                    if (neighbor == edge || !neighbor.selected) continue;
+                    Vector3d neighborEnd = (neighbor.a - point).LengthSquared < 1e-20
+                        ? neighbor.b : neighbor.a;
+                    if (Vector3d.Dot(extension, (neighborEnd - point).Normalized) > 0.9999)
+                        return;
+                }
+
+            CutSideCapFromFace(edge.first, edge, vertex, point, extension, incident);
+            CutSideCapFromFace(edge.second, edge, vertex, point, extension, incident);
+        }
+
+        private static void CutSideCapFromFace(SurfaceQuad face, SurfaceEdge edge, int vertex,
+            Vector3d point, Vector3d extension,
+            IList<(SurfaceQuad quad, int corner)> incident)
+        {
+            Vector3d inset = SideOffsetAtVertex(face, edge, vertex);
+            foreach (var (quad, corner) in incident)
+            {
+                if (quad == face || !SharesEdge(quad, face) ||
+                    Vector3d.Dot(quad.normal, face.normal) < 0.9999)
+                    continue;
+                Vector3d outgoing = (quad.points[(corner + 1) & 3] - point).Normalized;
+                Vector3d incoming = (quad.points[(corner + 3) & 3] - point).Normalized;
+                double extensionU = Vector3d.Dot(extension, outgoing) * edge.width;
+                double extensionV = Vector3d.Dot(extension, incoming) * edge.width;
+                double insetU = Vector3d.Dot(inset, outgoing);
+                double insetV = Vector3d.Dot(inset, incoming);
+                bool alongU = extensionU > 1e-12 && insetV > 1e-12;
+                bool alongV = extensionV > 1e-12 && insetU > 1e-12;
+                if (!alongU && !alongV) continue;
+
+                double notchU = Math.Max(extensionU, insetU);
+                double notchV = Math.Max(extensionV, insetV);
+                quad.sideCaps ??= new SideCapOffsets[4];
+                ref var sideCaps = ref quad.sideCaps[corner];
+                if (alongU) sideCaps.insetV = Math.Max(sideCaps.insetV, insetV);
+                if (alongV) sideCaps.insetU = Math.Max(sideCaps.insetU, insetU);
+                sideCaps.notchU = Math.Max(sideCaps.notchU, notchU);
+                sideCaps.notchV = Math.Max(sideCaps.notchV, notchV);
+
+                // A bevel ending over a flat seam needs a second end to form a cut here.
+                bool reachesBoundary = (alongU && !HasCoplanarNeighbor(quad, quad.edges[corner])) ||
+                    (alongV && !HasCoplanarNeighbor(quad, quad.edges[(corner + 3) & 3]));
+                if (!reachesBoundary) continue;
+
+                quad.notchU[corner] = Math.Max(quad.notchU[corner], notchU);
+                quad.notchV[corner] = Math.Max(quad.notchV[corner], notchV);
+                int participatingCount = 1;
+                if (quad.edges[corner].selected && quad.edges[corner].width > 0)
+                    participatingCount++;
+                if (quad.edges[(corner + 3) & 3].selected &&
+                    quad.edges[(corner + 3) & 3].width > 0)
+                    participatingCount++;
+                quad.outerProfile[corner] |= participatingCount >= 3;
+            }
+        }
+
+        private static bool HasCoplanarNeighbor(SurfaceQuad quad, SurfaceEdge edge)
+        {
+            SurfaceQuad neighbor = edge.first == quad ? edge.second : edge.second == quad ? edge.first : null;
+            return neighbor != null && Vector3d.Dot(quad.normal, neighbor.normal) > 0.9999;
+        }
+
+        private static Vector3d SideOffsetAtVertex(SurfaceQuad quad, SurfaceEdge edge, int vertex)
+        {
+            Vector3d center = (quad.points[0] + quad.points[1] + quad.points[2] + quad.points[3]) * 0.25;
+            for (int side = 0; side < 4; side++)
+                if (quad.edges[side] == edge &&
+                    (quad.vertexIds[side] == vertex || quad.vertexIds[(side + 1) & 3] == vertex))
+                    return SideOffset(quad, side, center);
+            return Vector3d.Zero;
+        }
+
+        private static Vector3d OffsetCorner(SurfaceQuad quad, int corner, Vector3d center)
+        {
+            Vector3d point = quad.points[corner];
+            OffsetSide(quad, corner, center, ref point);
+            OffsetSide(quad, (corner + 3) & 3, center, ref point);
+            return point;
+        }
+
+        private static void OffsetSide(SurfaceQuad quad, int side, Vector3d center,
+            ref Vector3d point)
+        {
+            point += SideOffset(quad, side, center);
+        }
+
+        private static Vector3d SideOffset(SurfaceQuad quad, int side, Vector3d center)
+        {
+            SurfaceEdge edge = quad.edges[side];
+            if (!edge.selected || edge.width == 0) return Vector3d.Zero;
+            Vector3d a = quad.points[side], b = quad.points[(side + 1) & 3];
+            Vector3d along = (b - a).Normalized;
+            Vector3d toCenter = center - (a + b) * 0.5;
+            Vector3d inward = toCenter - along * Vector3d.Dot(toCenter, along);
+            if (inward.LengthSquared > 1e-20)
+                return inward.Normalized * edge.width;
+            return Vector3d.Zero;
+        }
+
+        private Vector3d ProfilePoint(Vector3d origin, Vector3d first, Vector3d second,
+            int step, int steps)
+        {
+            if (step == 0) return origin + first;
+            if (step == steps) return origin + second;
+            if (profileRoundness <= 0) return origin + first + second;
+            if (profileRoundness >= 1) return origin;
+
+            double angle = Math.PI * 0.5 * step / steps;
+            double exponent = (1 - profileRoundness) / profileRoundness;
+            double firstWeight = 1 - Math.Pow(Math.Sin(angle), exponent);
+            double secondWeight = 1 - Math.Pow(Math.Cos(angle), exponent);
+            return origin + first * firstWeight + second * secondWeight;
+        }
+
+        private void AppendInnerProfile(List<Vector3d> outline, Vector3d origin,
+            Vector3d first, Vector3d second)
+        {
+            int steps = Math.Max(1, bevelSegments) * 2;
+            for (int step = 0; step <= steps; step++)
+                AddDistinctPoint(outline, ProfilePoint(origin, first, second, step, steps));
+        }
+
+        private bool TryGetOuterAngles(Vector3d origin, Vector3d moved,
+            Vector3d outgoing, Vector3d incoming, double uMax, double vMax,
+            out double startAngle, out double endAngle)
+        {
+            startAngle = endAngle = 0;
+            double baseU = Vector3d.Dot(moved - origin, outgoing);
+            double baseV = Vector3d.Dot(moved - origin, incoming);
+            if (uMax <= 0 || vMax <= 0 || baseU >= uMax || baseV >= vMax)
+                return false;
+
+            double exponent = profileRoundness / (1 - profileRoundness);
+            double uRatio = Math.Max(0, baseU / uMax);
+            double vRatio = Math.Max(0, baseV / vMax);
+            startAngle = Math.Asin(Math.Pow(uRatio, 1 / exponent));
+            endAngle = Math.Acos(Math.Pow(vRatio, 1 / exponent));
+            return startAngle + 1e-12 < endAngle;
+        }
+
+        private void AppendOuterProfile(List<Vector3d> outline, Vector3d origin,
+            Vector3d outgoing, Vector3d incoming, double uMax, double vMax,
+            double startAngle, double endAngle)
+        {
+            int steps = Math.Max(1, bevelSegments) * 2;
+            double exponent = profileRoundness / (1 - profileRoundness);
+            for (int step = 0; step <= steps; step++)
+            {
+                double angle = startAngle + (endAngle - startAngle) * step / steps;
+                Vector3d point = origin +
+                    outgoing * (uMax * Math.Pow(Math.Sin(angle), exponent)) +
+                    incoming * (vMax * Math.Pow(Math.Cos(angle), exponent));
+                AddDistinctPoint(outline, point);
+            }
+        }
+
+        private static void AddDistinctPoint(List<Vector3d> outline, Vector3d point)
+        {
+            if (outline.Count == 0 ||
+                (outline[outline.Count - 1] - point).LengthSquared > 1e-20)
+                outline.Add(point);
+        }
+
+        private static bool QuadWasMoved(SurfaceQuad quad, Vector3d[] moved)
+        {
+            for (int i = 0; i < 4; i++)
+                if ((moved[i] - quad.points[i]).LengthSquared > 1e-20)
+                    return true;
+            return false;
+        }
+    }
+}
