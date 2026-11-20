@@ -10,3 +10,6 @@
 	path = geometry4Sharp
 	url = https://github.com/NewWheelTech/geometry4Sharp.git
 	branch = main
+[submodule "XNodeGraph"]
+	path = XNodeGraph
+	url = https://github.com/petersvp/xNode-Unity.git
